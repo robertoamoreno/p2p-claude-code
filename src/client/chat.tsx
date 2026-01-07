@@ -5,7 +5,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { render, Box, Text, useInput, useApp } from 'ink';
 import TextInput from 'ink-text-input';
-import { RpcClient, Encryption, parsePairingUrl } from './rpc.js';
+import { RpcClient, Encryption, parsePairingUrl, type ConnectionState } from './rpc.js';
 import type { ClaudeMessage, ContentBlock, SessionOutput } from '../types.js';
 
 interface Message {
@@ -22,6 +22,7 @@ interface ChatAppProps {
 function ChatApp({ pairingUrl, directory }: ChatAppProps) {
     const { exit } = useApp();
     const [status, setStatus] = useState<'connecting' | 'spawning' | 'ready' | 'error'>('connecting');
+    const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
     const [error, setError] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
@@ -29,12 +30,40 @@ function ChatApp({ pairingUrl, directory }: ChatAppProps) {
     const [sessionId, setSessionId] = useState<string | null>(null);
     const [client, setClient] = useState<RpcClient | null>(null);
     const [host, setHost] = useState<string>('unknown');
+    const [reconnectCount, setReconnectCount] = useState(0);
 
     // Initialize connection
     useEffect(() => {
         let rpcClient: RpcClient | null = null;
         let pollInterval: NodeJS.Timeout | null = null;
         let mounted = true;
+        let currentSessionId: string | null = null;
+
+        async function spawnSession(): Promise<string | null> {
+            if (!rpcClient || !mounted) return null;
+
+            setStatus('spawning');
+
+            try {
+                const result = await rpcClient.call<{ type: string; sessionId?: string; errorMessage?: string }>(
+                    'spawn-session',
+                    { directory, sessionId: crypto.randomUUID() }
+                );
+
+                if (!mounted) return null;
+
+                if (result.type === 'success' && result.sessionId) {
+                    return result.sessionId;
+                } else {
+                    throw new Error(result.errorMessage || 'Failed to spawn session');
+                }
+            } catch (err) {
+                if (!mounted) return null;
+                setError((err as Error).message);
+                setStatus('error');
+                return null;
+            }
+        }
 
         async function init() {
             try {
@@ -49,65 +78,97 @@ function ChatApp({ pairingUrl, directory }: ChatAppProps) {
                 rpcClient = new RpcClient(info.dhtPublicKey, encryption);
                 setClient(rpcClient);
 
+                // Listen for connection state changes
+                rpcClient.onConnectionChange((state) => {
+                    if (!mounted) return;
+                    setConnectionState(state);
+
+                    if (state === 'connected') {
+                        setReconnectCount(prev => prev + 1);
+
+                        // Re-spawn session on reconnect (after initial connection)
+                        if (currentSessionId) {
+                            setMessages(prev => [...prev, {
+                                role: 'system',
+                                content: '🔄 Reconnected to server. Spawning new session...',
+                                timestamp: Date.now()
+                            }]);
+
+                            spawnSession().then(newSessionId => {
+                                if (newSessionId && mounted) {
+                                    currentSessionId = newSessionId;
+                                    setSessionId(newSessionId);
+                                    setStatus('ready');
+                                    setMessages(prev => [...prev, {
+                                        role: 'system',
+                                        content: '✅ New session ready.',
+                                        timestamp: Date.now()
+                                    }]);
+                                }
+                            });
+                        }
+                    } else if (state === 'disconnected' && currentSessionId) {
+                        setMessages(prev => [...prev, {
+                            role: 'system',
+                            content: '⚠️ Connection lost. Attempting to reconnect...',
+                            timestamp: Date.now()
+                        }]);
+                    }
+                });
+
                 // Connect
                 await rpcClient.ensureConnected();
                 if (!mounted) return;
 
-                setStatus('spawning');
+                // Spawn initial session
+                currentSessionId = await spawnSession();
+                if (!currentSessionId) return;
 
-                // Spawn session
-                const result = await rpcClient.call<{ type: string; sessionId?: string; errorMessage?: string }>(
-                    'spawn-session',
-                    { directory, sessionId: crypto.randomUUID() }
-                );
+                setSessionId(currentSessionId);
+                setStatus('ready');
 
-                if (!mounted) return;
+                // Start polling for output
+                pollInterval = setInterval(async () => {
+                    if (!rpcClient || !mounted || !currentSessionId) return;
 
-                if (result.type === 'success' && result.sessionId) {
-                    setSessionId(result.sessionId);
-                    setStatus('ready');
+                    // Skip polling if disconnected
+                    if (rpcClient.getConnectionState() !== 'connected') return;
 
-                    // Start polling for output
-                    pollInterval = setInterval(async () => {
-                        if (!rpcClient || !mounted) return;
-                        try {
-                            const output = await rpcClient.call<{ messages: SessionOutput[] }>(
-                                'get-output',
-                                { sessionId: result.sessionId, clear: true },
-                                5000
-                            );
+                    try {
+                        const output = await rpcClient.call<{ messages: SessionOutput[] }>(
+                            'get-output',
+                            { sessionId: currentSessionId, clear: true },
+                            5000
+                        );
 
-                            if (output.messages?.length > 0) {
-                                for (const msg of output.messages) {
-                                    if (msg.type === 'session-output' && msg.data.type === 'assistant') {
-                                        const content = extractContent(msg.data);
-                                        if (content) {
-                                            setMessages(prev => [...prev, {
-                                                role: 'assistant',
-                                                content,
-                                                timestamp: Date.now()
-                                            }]);
-                                            setIsThinking(false);
-                                        }
+                        if (output.messages?.length > 0) {
+                            for (const msg of output.messages) {
+                                if (msg.type === 'session-output' && msg.data.type === 'assistant') {
+                                    const content = extractContent(msg.data);
+                                    if (content) {
+                                        setMessages(prev => [...prev, {
+                                            role: 'assistant',
+                                            content,
+                                            timestamp: Date.now()
+                                        }]);
+                                        setIsThinking(false);
+                                    }
 
-                                        const tools = extractToolUse(msg.data);
-                                        for (const tool of tools) {
-                                            setMessages(prev => [...prev, {
-                                                role: 'tool',
-                                                content: tool,
-                                                timestamp: Date.now()
-                                            }]);
-                                        }
+                                    const tools = extractToolUse(msg.data);
+                                    for (const tool of tools) {
+                                        setMessages(prev => [...prev, {
+                                            role: 'tool',
+                                            content: tool,
+                                            timestamp: Date.now()
+                                        }]);
                                     }
                                 }
                             }
-                        } catch {
-                            // Ignore polling errors
                         }
-                    }, 500);
-                } else {
-                    throw new Error(result.errorMessage || 'Failed to spawn session');
-                }
+                    } catch {
+                        // Ignore polling errors
+                    }
+                }, 500);
             } catch (err) {
                 if (!mounted) return;
                 setError((err as Error).message);
@@ -201,12 +262,21 @@ function ChatApp({ pairingUrl, directory }: ChatAppProps) {
         );
     }
 
+    // Connection status indicator
+    const connectionIndicator = connectionState === 'connected'
+        ? <Text color="green">●</Text>
+        : connectionState === 'connecting'
+            ? <Text color="yellow">◐</Text>
+            : <Text color="red">○</Text>;
+
     // Main chat UI
     return (
         <Box flexDirection="column" padding={1}>
             {/* Header */}
             <Box marginBottom={1}>
                 <Text color="cyan" bold>P2P Claude Code Chat</Text>
+                <Text color="gray"> </Text>
+                {connectionIndicator}
                 <Text color="gray"> • </Text>
                 <Text color="gray">{host}</Text>
                 <Text color="gray"> • </Text>

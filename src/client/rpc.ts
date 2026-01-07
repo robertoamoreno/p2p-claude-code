@@ -55,6 +55,9 @@ interface PendingRequest {
     timeoutId: NodeJS.Timeout;
 }
 
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
+export type ConnectionListener = (state: ConnectionState) => void;
+
 export class RpcClient {
     private dhtPublicKey: Buffer;
     private encryption: Encryption;
@@ -64,6 +67,11 @@ export class RpcClient {
     private pendingRequests = new Map<string, PendingRequest>();
     private buffer = '';
     private connectPromise: Promise<void> | null = null;
+    private reconnectAttempts = 0;
+    private maxReconnectAttempts = 10;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private isDestroyed = false;
+    private connectionListeners: ConnectionListener[] = [];
 
     constructor(dhtPublicKey: string, encryption: Encryption) {
         this.dhtPublicKey = Buffer.from(dhtPublicKey, 'base64');
@@ -71,7 +79,40 @@ export class RpcClient {
         this.dht = new DHT();
     }
 
+    /**
+     * Add a listener for connection state changes
+     */
+    onConnectionChange(listener: ConnectionListener): () => void {
+        this.connectionListeners.push(listener);
+        return () => {
+            this.connectionListeners = this.connectionListeners.filter(l => l !== listener);
+        };
+    }
+
+    private notifyConnectionChange(state: ConnectionState): void {
+        for (const listener of this.connectionListeners) {
+            try {
+                listener(state);
+            } catch {
+                // Ignore listener errors
+            }
+        }
+    }
+
+    /**
+     * Get current connection state
+     */
+    getConnectionState(): ConnectionState {
+        if (this.connectPromise) return 'connecting';
+        if (this.connected) return 'connected';
+        return 'disconnected';
+    }
+
     async ensureConnected(): Promise<void> {
+        if (this.isDestroyed) {
+            throw new Error('Client has been destroyed');
+        }
+
         if (this.connected && this.socket && !this.socket.destroyed) {
             return;
         }
@@ -80,12 +121,16 @@ export class RpcClient {
             return this.connectPromise;
         }
 
+        this.notifyConnectionChange('connecting');
+
         this.connectPromise = new Promise((resolve, reject) => {
             this.socket = this.dht.connect(this.dhtPublicKey);
 
             const onConnect = () => {
                 this.connected = true;
                 this.connectPromise = null;
+                this.reconnectAttempts = 0; // Reset on successful connection
+                this.notifyConnectionChange('connected');
                 resolve();
             };
 
@@ -98,14 +143,25 @@ export class RpcClient {
                     reject(err);
                 }
                 this.connected = false;
+                this.notifyConnectionChange('disconnected');
             });
 
             this.socket.on('close', () => {
+                const wasConnected = this.connected;
                 this.connected = false;
+                this.connectPromise = null;
+                this.notifyConnectionChange('disconnected');
+
+                // Reject pending requests
                 for (const [, { reject }] of this.pendingRequests) {
                     reject(new Error('Connection closed'));
                 }
                 this.pendingRequests.clear();
+
+                // Auto-reconnect if we were previously connected
+                if (wasConnected && !this.isDestroyed) {
+                    this.scheduleReconnect();
+                }
             });
 
             this.socket.on('data', (chunk: Buffer) => {
@@ -122,6 +178,60 @@ export class RpcClient {
         });
 
         return this.connectPromise;
+    }
+
+    /**
+     * Schedule a reconnection attempt with exponential backoff
+     */
+    private scheduleReconnect(): void {
+        if (this.isDestroyed || this.reconnectTimer) {
+            return;
+        }
+
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            console.error(`[RPC] Max reconnect attempts (${this.maxReconnectAttempts}) reached`);
+            return;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+        this.reconnectAttempts++;
+
+        console.log(`[RPC] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+
+        this.reconnectTimer = setTimeout(async () => {
+            this.reconnectTimer = null;
+
+            if (this.isDestroyed) return;
+
+            try {
+                await this.ensureConnected();
+                console.log('[RPC] Reconnected successfully');
+            } catch (err) {
+                console.error('[RPC] Reconnect failed:', (err as Error).message);
+                // Schedule another attempt
+                this.scheduleReconnect();
+            }
+        }, delay);
+    }
+
+    /**
+     * Manually trigger a reconnection
+     */
+    async reconnect(): Promise<void> {
+        if (this.socket && !this.socket.destroyed) {
+            this.socket.destroy();
+        }
+        this.connected = false;
+        this.connectPromise = null;
+        this.reconnectAttempts = 0;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        await this.ensureConnected();
     }
 
     private processBuffer(): void {
@@ -184,9 +294,27 @@ export class RpcClient {
     }
 
     async destroy(): Promise<void> {
+        this.isDestroyed = true;
+
+        // Clear reconnect timer
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        // Reject all pending requests
+        for (const [, { reject, timeoutId }] of this.pendingRequests) {
+            clearTimeout(timeoutId);
+            reject(new Error('Client destroyed'));
+        }
+        this.pendingRequests.clear();
+
+        // Close socket
         if (this.socket && !this.socket.destroyed) {
             this.socket.destroy();
         }
+
+        // Destroy DHT
         await this.dht.destroy();
     }
 }
