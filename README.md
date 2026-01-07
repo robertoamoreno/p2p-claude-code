@@ -49,7 +49,11 @@ npm run build
 ### Start Daemon
 
 ```bash
+# Start with no restrictions
 node dist/index.js daemon
+
+# Start with directory restriction (sessions can only work within this path)
+node dist/index.js daemon --root-dir ~/projects
 ```
 
 Output:
@@ -100,8 +104,11 @@ Keys are stored in `~/.p2p-claude/`:
 | Key Exchange | Embedded in pairing URL |
 | Authentication | Possession of pairing URL = full access |
 | Network | HyperDHT (no central server) |
+| Directory Restriction | Optional `--root-dir` limits session scope |
 
 **Note:** Anyone with the pairing URL has full access to spawn Claude sessions on your machine. Keep it private.
+
+Use `--root-dir` to limit sessions to a specific directory when sharing access with others.
 
 ## RPC Methods
 
@@ -112,6 +119,7 @@ Keys are stored in `~/.p2p-claude/`:
 | `get-output` | Get buffered Claude output |
 | `stop-session` | Stop a session |
 | `list-sessions` | List active sessions |
+| `get-session-state` | Get session state from DHT (for recovery) |
 | `ping` | Test connectivity |
 
 ## Project Structure
@@ -136,6 +144,27 @@ p2p-claude-code/
 │   └── p2p-chat.mjs          # Client bin wrapper
 └── dist/                     # Compiled JavaScript
 ```
+
+## DHT Features
+
+### Server Refresh
+The daemon automatically refreshes its DHT announcement:
+- **Periodic refresh**: Every 60 seconds (configurable)
+- **Network change detection**: Detects IP changes every 10 seconds and triggers refresh
+
+This ensures clients can always find the daemon even after network changes (WiFi switch, IP renewal, etc.).
+
+### Graceful Shutdown
+When stopped (Ctrl+C), the daemon:
+1. Clears all timers
+2. Closes the DHT server
+3. Properly unannounces from the DHT network (allows other nodes to update their routing tables)
+
+### Mutable Storage
+Session state is automatically synced to the DHT:
+- Clients can call `get-session-state` to discover active sessions
+- Useful for reconnecting clients to find existing sessions
+- State includes: sessionId, pid, createdAt, directory
 
 ## Environment Variables
 

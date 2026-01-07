@@ -22,24 +22,68 @@ declare module 'hyperdht' {
         write(data: string | Buffer): boolean;
         destroy(): void;
         destroyed: boolean;
+        remotePublicKey: Buffer;
+        publicKey: Buffer;
     }
 
     interface DhtServer extends EventEmitter {
         listen(keyPair: KeyPair): Promise<void>;
         close(): Promise<void>;
-        address(): { publicKey: Buffer };
+        address(): { publicKey: Buffer; host: string; port: number };
+        refresh(): void;
+    }
+
+    interface DestroyOptions {
+        force?: boolean;
+    }
+
+    interface MutableGetOptions {
+        seq?: number;
+        latest?: boolean;
+    }
+
+    interface MutableGetResult {
+        value: Buffer | null;
+        seq: number;
+        signature: Buffer;
+    }
+
+    interface ImmutablePutResult {
+        hash: Buffer;
+    }
+
+    interface ImmutableGetResult {
+        value: Buffer | null;
     }
 
     class DHT {
-        constructor(options?: { bootstrap?: string[] });
+        constructor(options?: {
+            bootstrap?: string[];
+            connectionKeepAlive?: number | false;
+        });
 
         static keyPair(seed?: Buffer): KeyPair;
+        static bootstrapper(port: number, host: string, options?: object): DHT;
 
+        createServer(options?: { firewall?: (remotePublicKey: Buffer, payload?: Buffer) => boolean }, onConnection?: (socket: DhtSocket) => void): DhtServer;
         createServer(onConnection?: (socket: DhtSocket) => void): DhtServer;
-        connect(publicKey: Buffer): DhtSocket;
-        destroy(): Promise<void>;
+        connect(publicKey: Buffer, options?: { keyPair?: KeyPair; nodes?: object[] }): DhtSocket;
+        destroy(options?: DestroyOptions): Promise<void>;
+
+        // Mutable storage (signed, versioned records)
+        mutablePut(keyPair: KeyPair, value: Buffer, options?: { seq?: number }): Promise<{ seq: number }>;
+        mutableGet(publicKey: Buffer, options?: MutableGetOptions): Promise<MutableGetResult | null>;
+
+        // Immutable storage (content-addressed)
+        immutablePut(value: Buffer): Promise<ImmutablePutResult>;
+        immutableGet(hash: Buffer): Promise<ImmutableGetResult | null>;
+
+        // Peer discovery
+        lookup(topic: Buffer, options?: object): AsyncIterable<object>;
+        announce(topic: Buffer, keyPair: KeyPair, relayAddresses?: object[], options?: object): AsyncIterable<object>;
+        unannounce(topic: Buffer, keyPair: KeyPair, options?: object): Promise<void>;
     }
 
     export default DHT;
-    export { DHT, KeyPair, DhtSocket, DhtServer };
+    export { DHT, KeyPair, DhtSocket, DhtServer, DestroyOptions, MutableGetOptions, MutableGetResult, ImmutablePutResult, ImmutableGetResult };
 }

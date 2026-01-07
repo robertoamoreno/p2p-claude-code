@@ -24,6 +24,7 @@ export interface TrackedSession {
     process: import('node:child_process').ChildProcess;
     outputBuffer: SessionOutput[];
     createdAt: number;
+    directory: string;
 }
 
 // Output from Claude session
@@ -101,5 +102,6 @@ export interface PairingPayload {
         host: string;
         platform: string;
         createdAt: number;
+        rootDir?: string; // If set, sessions are restricted to this directory
     };
 }

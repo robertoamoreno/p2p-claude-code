@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { DhtServer } from './dht.js';
 import { Encryption, generateEncryptionKey } from './encryption.js';
@@ -26,6 +26,7 @@ import type {
 export interface DaemonOptions {
     dataDir?: string;
     encryptionKey?: string; // Base64, will generate if not provided
+    rootDir?: string; // If set, sessions can only be spawned within this directory
 }
 
 export class Daemon {
@@ -33,9 +34,11 @@ export class Daemon {
     private encryption: Encryption;
     private sessions = new Map<string, TrackedSession>();
     private dataDir: string;
+    private rootDir: string | null;
 
     constructor(options: DaemonOptions = {}) {
         this.dataDir = options.dataDir || process.env.P2P_CLAUDE_DATA_DIR || join(homedir(), '.p2p-claude');
+        this.rootDir = options.rootDir ? resolve(options.rootDir) : null;
 
         // Load or generate encryption key
         const encryptionKey = options.encryptionKey || this.loadOrCreateEncryptionKey();
@@ -94,6 +97,11 @@ export class Daemon {
         console.log('DHT Public Key:');
         console.log(`  ${dhtPublicKey}`);
         console.log('');
+        if (this.rootDir) {
+            console.log('Root Directory (sessions restricted to):');
+            console.log(`  ${this.rootDir}`);
+            console.log('');
+        }
         console.log('Pairing URL:');
         console.log(`  ${this.getPairingUrl()}`);
         console.log('');
@@ -136,7 +144,8 @@ export class Daemon {
             metadata: {
                 host: hostname(),
                 platform: process.platform,
-                createdAt: Date.now()
+                createdAt: Date.now(),
+                rootDir: this.rootDir || undefined
             }
         };
 
@@ -169,6 +178,9 @@ export class Daemon {
             case 'ping':
                 return { pong: true, timestamp: Date.now() };
 
+            case 'get-session-state':
+                return this.getSessionStateFromDht();
+
             default:
                 throw new Error(`Unknown method: ${method}`);
         }
@@ -180,6 +192,18 @@ export class Daemon {
     private async spawnSession(options: SpawnSessionOptions): Promise<SpawnSessionResult> {
         const sessionId = options.sessionId || randomUUID();
         const permissionMode = options.permissionMode || 'acceptEdits';
+
+        // Validate directory is within rootDir if set
+        if (this.rootDir) {
+            const resolvedDir = resolve(options.directory);
+            if (!resolvedDir.startsWith(this.rootDir)) {
+                console.log(`[Session] Rejected: ${resolvedDir} is outside root ${this.rootDir}`);
+                return {
+                    type: 'error',
+                    errorMessage: `Directory ${options.directory} is outside allowed root: ${this.rootDir}`
+                };
+            }
+        }
 
         console.log(`[Session] Spawning ${sessionId} in ${options.directory}`);
         console.log(`[Session] Permission mode: ${permissionMode}`);
@@ -196,7 +220,8 @@ export class Daemon {
                 pid: claudeSession.process.pid!,
                 process: claudeSession.process,
                 outputBuffer: [],
-                createdAt: Date.now()
+                createdAt: Date.now(),
+                directory: options.directory
             };
 
             // Capture output
@@ -217,9 +242,13 @@ export class Daemon {
             claudeSession.process.on('exit', () => {
                 console.log(`[Session] ${sessionId} exited`);
                 this.sessions.delete(sessionId);
+                this.syncSessionStateToDht();
             });
 
             this.sessions.set(sessionId, trackedSession);
+
+            // Sync state to DHT
+            this.syncSessionStateToDht();
 
             return {
                 type: 'success',
@@ -285,6 +314,9 @@ export class Daemon {
         session.process.kill('SIGTERM');
         this.sessions.delete(sessionId);
 
+        // Sync state to DHT
+        this.syncSessionStateToDht();
+
         return { success: true };
     }
 
@@ -317,5 +349,31 @@ export class Daemon {
             onOutput: () => { /* Already set up */ },
             kill: () => session.process.kill('SIGTERM')
         };
+    }
+
+    /**
+     * Sync current session state to DHT for client discovery
+     * This allows clients to see active sessions even after reconnecting
+     */
+    private syncSessionStateToDht(): void {
+        const sessionStates = Array.from(this.sessions.values()).map(session => ({
+            sessionId: session.sessionId,
+            pid: session.pid,
+            createdAt: session.createdAt,
+            directory: session.directory
+        }));
+
+        // Fire and forget - don't block on DHT sync
+        this.dhtServer.storeSessionState(sessionStates).catch(err => {
+            console.error('[Daemon] Failed to sync session state to DHT:', err);
+        });
+    }
+
+    /**
+     * Get session state from DHT
+     * Clients can use this to discover active sessions after reconnecting
+     */
+    private async getSessionStateFromDht(): Promise<{ sessions: Array<{ sessionId: string; pid: number; createdAt: number; directory?: string }>; updatedAt: number } | null> {
+        return this.dhtServer.getSessionState();
     }
 }

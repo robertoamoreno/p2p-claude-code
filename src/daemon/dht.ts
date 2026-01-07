@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { networkInterfaces } from 'node:os';
 import type { RpcRequest, RpcResponse } from '../types.js';
 import { Encryption } from './encryption.js';
 
@@ -18,6 +19,14 @@ export interface DhtServerOptions {
     dataDir?: string;
     encryption: Encryption;
     onRequest: RpcHandler;
+    refreshInterval?: number; // ms, default 60000 (1 minute)
+}
+
+export interface SessionState {
+    sessionId: string;
+    pid: number;
+    createdAt: number;
+    directory?: string;
 }
 
 export class DhtServer {
@@ -27,11 +36,16 @@ export class DhtServer {
     private encryption: Encryption;
     private onRequest: RpcHandler;
     private dataDir: string;
+    private refreshInterval: number;
+    private refreshTimer: NodeJS.Timeout | null = null;
+    private networkCheckTimer: NodeJS.Timeout | null = null;
+    private lastNetworkSignature: string = '';
 
     constructor(options: DhtServerOptions) {
         this.encryption = options.encryption;
         this.onRequest = options.onRequest;
         this.dataDir = options.dataDir || join(homedir(), '.p2p-claude');
+        this.refreshInterval = options.refreshInterval ?? 60000; // 1 minute default
         this.dht = new DHT();
         this.keyPair = this.loadOrCreateKeyPair();
     }
@@ -80,6 +94,83 @@ export class DhtServer {
         });
 
         await this.server.listen(this.keyPair);
+
+        // Initialize network signature for change detection
+        this.lastNetworkSignature = this.getNetworkSignature();
+
+        // Start periodic refresh timer
+        this.startRefreshTimer();
+
+        // Start network change detection
+        this.startNetworkChangeDetection();
+
+        console.log('[DHT] Server started with auto-refresh enabled');
+    }
+
+    /**
+     * Start periodic refresh timer
+     */
+    private startRefreshTimer(): void {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+        }
+
+        this.refreshTimer = setInterval(() => {
+            this.refresh();
+        }, this.refreshInterval);
+    }
+
+    /**
+     * Start network change detection (checks every 10 seconds)
+     */
+    private startNetworkChangeDetection(): void {
+        if (this.networkCheckTimer) {
+            clearInterval(this.networkCheckTimer);
+        }
+
+        this.networkCheckTimer = setInterval(() => {
+            const currentSignature = this.getNetworkSignature();
+            if (currentSignature !== this.lastNetworkSignature) {
+                console.log('[DHT] Network change detected, refreshing...');
+                this.lastNetworkSignature = currentSignature;
+                this.refresh();
+            }
+        }, 10000); // Check every 10 seconds
+    }
+
+    /**
+     * Get a signature of current network interfaces for change detection
+     */
+    private getNetworkSignature(): string {
+        const interfaces = networkInterfaces();
+        const addresses: string[] = [];
+
+        for (const [name, nets] of Object.entries(interfaces)) {
+            if (!nets) continue;
+            for (const net of nets) {
+                // Skip internal/loopback interfaces
+                if (!net.internal && net.family === 'IPv4') {
+                    addresses.push(`${name}:${net.address}`);
+                }
+            }
+        }
+
+        return addresses.sort().join('|');
+    }
+
+    /**
+     * Refresh server announcement on the DHT
+     * Call this when network conditions change (IP change, reconnect, etc.)
+     */
+    refresh(): void {
+        if (this.server) {
+            try {
+                this.server.refresh();
+                console.log('[DHT] Server refreshed');
+            } catch (error) {
+                console.error('[DHT] Refresh error:', error);
+            }
+        }
     }
 
     /**
@@ -155,12 +246,113 @@ export class DhtServer {
     }
 
     /**
-     * Stop the DHT server
+     * Stop the DHT server with graceful shutdown
      */
     async stop(): Promise<void> {
+        console.log('[DHT] Initiating graceful shutdown...');
+
+        // Clear timers
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+        if (this.networkCheckTimer) {
+            clearInterval(this.networkCheckTimer);
+            this.networkCheckTimer = null;
+        }
+
+        // Close server
         if (this.server) {
             await this.server.close();
+            console.log('[DHT] Server closed');
         }
-        await this.dht.destroy();
+
+        // Graceful destroy - allows proper unannouncement from DHT
+        // force: false means it will wait for pending operations and unannounce
+        await this.dht.destroy({ force: false });
+        console.log('[DHT] DHT destroyed gracefully');
+    }
+
+    // ========================================
+    // Mutable Storage API
+    // ========================================
+
+    /**
+     * Store session state in the DHT (mutable record)
+     * This allows clients to discover session state even after reconnecting
+     */
+    async storeSessionState(sessions: SessionState[]): Promise<void> {
+        try {
+            const value = Buffer.from(JSON.stringify({
+                sessions,
+                updatedAt: Date.now()
+            }));
+
+            await this.dht.mutablePut(this.keyPair, value);
+            console.log(`[DHT] Stored ${sessions.length} session(s) in DHT`);
+        } catch (error) {
+            console.error('[DHT] Failed to store session state:', error);
+        }
+    }
+
+    /**
+     * Retrieve session state from the DHT
+     * Returns null if no state found or on error
+     */
+    async getSessionState(): Promise<{ sessions: SessionState[]; updatedAt: number } | null> {
+        try {
+            const result = await this.dht.mutableGet(this.keyPair.publicKey, { latest: true });
+
+            if (!result?.value) {
+                return null;
+            }
+
+            const data = JSON.parse(result.value.toString());
+            console.log(`[DHT] Retrieved ${data.sessions?.length || 0} session(s) from DHT`);
+            return data;
+        } catch (error) {
+            console.error('[DHT] Failed to get session state:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Clear session state from DHT (store empty state)
+     */
+    async clearSessionState(): Promise<void> {
+        await this.storeSessionState([]);
+    }
+
+    /**
+     * Store arbitrary data in DHT (immutable - content-addressed)
+     * Returns the hash that can be used to retrieve it
+     */
+    async storeImmutable(data: unknown): Promise<string | null> {
+        try {
+            const value = Buffer.from(JSON.stringify(data));
+            const result = await this.dht.immutablePut(value);
+            const hash = result.hash.toString('hex');
+            console.log(`[DHT] Stored immutable data: ${hash}`);
+            return hash;
+        } catch (error) {
+            console.error('[DHT] Failed to store immutable data:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Retrieve immutable data by hash
+     */
+    async getImmutable(hash: string): Promise<unknown | null> {
+        try {
+            const result = await this.dht.immutableGet(Buffer.from(hash, 'hex'));
+            if (!result?.value) {
+                return null;
+            }
+            return JSON.parse(result.value.toString());
+        } catch (error) {
+            console.error('[DHT] Failed to get immutable data:', error);
+            return null;
+        }
     }
 }
