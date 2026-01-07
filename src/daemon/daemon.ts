@@ -35,6 +35,7 @@ export class Daemon {
     private sessions = new Map<string, TrackedSession>();
     private dataDir: string;
     private rootDir: string | null;
+    private isShuttingDown = false;
 
     constructor(options: DaemonOptions = {}) {
         this.dataDir = options.dataDir || process.env.P2P_CLAUDE_DATA_DIR || join(homedir(), '.p2p-claude');
@@ -123,6 +124,9 @@ export class Daemon {
      * Stop the daemon
      */
     async stop(): Promise<void> {
+        // Set shutdown flag to prevent DHT operations during teardown
+        this.isShuttingDown = true;
+
         // Kill all sessions
         for (const [sessionId, session] of this.sessions) {
             console.log(`Stopping session ${sessionId}...`);
@@ -356,6 +360,11 @@ export class Daemon {
      * This allows clients to see active sessions even after reconnecting
      */
     private syncSessionStateToDht(): void {
+        // Don't sync during shutdown - DHT may be destroyed
+        if (this.isShuttingDown) {
+            return;
+        }
+
         const sessionStates = Array.from(this.sessions.values()).map(session => ({
             sessionId: session.sessionId,
             pid: session.pid,
@@ -365,7 +374,10 @@ export class Daemon {
 
         // Fire and forget - don't block on DHT sync
         this.dhtServer.storeSessionState(sessionStates).catch(err => {
-            console.error('[Daemon] Failed to sync session state to DHT:', err);
+            // Ignore errors during shutdown
+            if (!this.isShuttingDown) {
+                console.error('[Daemon] Failed to sync session state to DHT:', err);
+            }
         });
     }
 
